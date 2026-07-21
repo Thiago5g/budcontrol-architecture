@@ -153,6 +153,113 @@ Brazilian payment codes (boleto barcodes, Pix keys) are encrypted at the applica
 **5. Aggressive Deduplication**
 Financial data arrives from multiple channels — WhatsApp photos, PDF imports, manual entry, email parsing. A deduplication engine cross-references amount, date, description, and source metadata to prevent duplicate transactions across all ingestion paths.
 
+**6. Tool-Calling Architecture over Hard-Coded Flows**
+Instead of building separate endpoints for each WhatsApp action, the system uses OpenAI function calling with a registry of 33+ tools. Adding a new financial action means defining a tool schema and handler — no changes to the conversation engine. This mirrors how AI labs build agentic systems.
+
+**7. Multi-Channel Ingestion with Unified Dedup**
+Financial data arrives from 5+ channels (WhatsApp photo, email PDF, manual entry, CSV import, OFX import). A deduplication engine cross-references amount, date, description similarity, and source metadata to prevent duplicates without blocking legitimate similar transactions.
+
+---
+
+## AI Tool Architecture
+
+The WhatsApp assistant uses an **agentic tool-calling pattern** with 33+ specialized tools:
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ User Message │────▶│  GPT-4 with  │────▶│ Tool Router  │
+│ (text/audio) │     │  Tool Defs   │     │              │
+└──────────────┘     └──────────────┘     └──────┬───────┘
+                                                  │
+          ┌───────────────────────────────────────┼──────────────────┐
+          ▼                    ▼                   ▼                  ▼
+  ┌──────────────┐   ┌──────────────┐  ┌──────────────────┐  ┌───────────┐
+  │ Financial    │   │ Card/Invoice │  │ Accounts Payable │  │ Reports & │
+  │ Movements    │   │ Management   │  │ & Payments       │  │ Analytics │
+  └──────────────┘   └──────────────┘  └──────────────────┘  └───────────┘
+```
+
+**Each tool:**
+- Has a typed input/output schema (validated before execution)
+- Returns structured results for the LLM to format as natural language
+- Logs execution with correlation ID for audit trail
+- Respects confirmation rules — never mutates financial data without user consent
+- Can be composed (one tool's output triggers another tool suggestion)
+
+**Tool categories:**
+| Category | Examples | Count |
+|----------|----------|-------|
+| Financial movements | Create, list, categorize, delete | 8 |
+| Credit cards & invoices | Import, list charges, manage cards | 7 |
+| Accounts payable | Create, pay, attach receipt, list due | 6 |
+| Bank accounts | List, set default, check balance | 4 |
+| Categories & rules | Create, list, set auto-categorization | 4 |
+| Reports | Monthly summary, spending by category | 3 |
+| System | Set intent, confirm batch, cancel | 3 |
+
+---
+
+## Distributed Processing & Reliability
+
+```
+┌─────────────┐     ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│ WhatsApp    │────▶│ File Type   │────▶│ Content      │────▶│ Classifier  │
+│ Webhook     │     │ Detection   │     │ Extraction   │     │ (AI)        │
+└─────────────┘     └─────────────┘     └──────────────┘     └──────┬──────┘
+                                                                     │
+                    ┌────────────────────────────────────────────────┘
+                    ▼
+            ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+            │ Handler      │────▶│ Preview      │────▶│ Persist      │
+            │ (per type)   │     │ + Confirm    │     │ (on confirm) │
+            └──────────────┘     └──────────────┘     └──────────────┘
+```
+
+**Reliability patterns implemented:**
+
+- **Idempotency:** Document processing uses content hashing to prevent duplicate imports across channels (email, WhatsApp, manual upload)
+- **Staged persistence:** Files land in S3 staging (24h TTL) before promotion to permanent storage on user confirmation
+- **Graceful degradation:** If OpenAI is unavailable, documents are queued for retry rather than failing the user interaction
+- **Session state:** WhatsApp sessions track pending intents and batch confirmations, surviving individual message failures
+- **Timeout handling:** AI extraction has configurable timeouts with fallback to manual input prompts
+- **Atomic operations:** Financial mutations use database transactions to prevent partial state
+
+---
+
+## Observability
+
+- **Structured logging:** JSON logs with correlation IDs per WhatsApp session, traceable across the full document pipeline
+- **Error categorization:** Errors classified by type (AI extraction failure, payment code invalid, file too large) with context for debugging
+- **Health monitoring:** API health endpoint with dependency checks (PostgreSQL, S3 connectivity, OpenAI reachability)
+- **Classification confidence:** Document classifier outputs confidence scores, logged for quality monitoring and threshold tuning
+- **Processing metrics:** Track per-document-type success rates, extraction accuracy, and retry counts
+
+---
+
+## Data Model Overview
+
+```
+User
+ ├── BankAccounts
+ ├── CreditCards
+ │    └── CardExpenses
+ │         └── Invoices (imported PDFs)
+ ├── FinancialMovements (income/expense)
+ ├── AccountsPayable
+ │    ├── PaymentInstructions (encrypted)
+ │    └── Attachments (S3 references)
+ ├── Categories
+ │    └── CategorizationRules
+ └── WhatsappSessions
+      └── PendingBatches (awaiting confirmation)
+```
+
+**Key relationships:**
+- Every entity is scoped by `userId` (strict multi-tenancy)
+- `PaymentInstructions` stores encrypted boleto/PIX codes (decrypted only at payment time)
+- `PendingBatches` hold extracted data awaiting user confirmation before persisting as real records
+- `CategorizationRules` are user-defined patterns that override AI suggestions for consistent categorization
+
 ---
 
 ## Tech Stack
